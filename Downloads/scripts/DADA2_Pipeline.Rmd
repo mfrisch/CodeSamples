@@ -1,0 +1,268 @@
+# Contributors: Michael Frisch, Kranthi Vavikolanu
+# Read Lab @ Emory University
+#
+# This script takes output files from another script I wrote from
+# a bacterial 16S rRNA OTU classifier software, DADA2, and
+# generates a report containing several graphs about population
+# content, diversity scores, and several other metrics
+#
+# The script searches for fasta files in the working directory and
+# output is written in the same directory.
+
+```{r global_options,include=FALSE}
+knitr::opts_chunk$set(echo=FALSE, warning=FALSE, message=FALSE, fig.path='Figs/')
+```
+
+```{r libraries, include=FALSE}
+suppressWarnings(suppressMessages(lapply(c("phyloseq","ggplot2","dada2","ShortRead","ape","DESeq2","doParallel","DirichletMultinomial","lattice","xtable","RColorBrewer"),require,character.only=T)))
+```
+
+```{r variable_assignment,include=FALSE}
+classify<-FALSE
+# If setting classify to TRUE, this data can be included by setting meta_factor to "Class"
+meta_factor<-"type"
+tax_level1<-"Phylum"
+tax_level2<-"Genus"
+cache_bool<-TRUE
+```
+
+```{r pre-report_calculations_pt1, include=FALSE, cache=cache_bool}
+# Load Data
+path <- getwd()
+fns <- list.files(path)
+fastqs <- fns[grepl(".fastq$", fns)]
+fastqs <- sort(fastqs)
+fnFs <- fastqs[grepl("_1", fastqs)]
+fnRs <- fastqs[grepl("_2", fastqs)]
+
+# Filtering and Trimming
+filtFs <- paste0(path, "/", sapply(strsplit(fnFs, "\\."), `[`, 1), "_filt.fastq.gz")
+filtRs <- paste0(path, "/", sapply(strsplit(fnRs, "\\."), `[`, 1), "_filt.fastq.gz")
+for(i in seq_along(fnFs)) {
+  fastqPairedFilter(paste0(path, "/", c(fnFs[i], fnRs[i])), c(filtFs[i], filtRs[i]), maxN=0, maxEE=2, truncQ=2, trimLeft=c(10, 10), truncLen=c(240,160), compress=TRUE)
+}
+
+# Dereplication
+derepFs <- lapply(filtFs, derepFastq)
+derepRs <- lapply(filtRs, derepFastq)
+sam_names <- sapply(strsplit(fnFs, "/"), tail, n=1)
+sam_names <- sapply(strsplit(sam_names, "_"), `[`, 1)
+names(derepFs) <- sam_names
+names(derepRs) <- sam_names
+
+# Sample Inference
+dadaFs <- dada(derepFs, err=inflateErr(tperr1,3), errorEstimationFunction=loessErrfun, selfConsist = TRUE)
+dadaRs <- dada(derepRs, err=inflateErr(tperr1,3), errorEstimationFunction=loessErrfun, selfConsist = TRUE)
+#plotErrors(dadaFs[[1]], "A", nominalQ=TRUE)
+
+# Identify Chimeras
+bimFs <- sapply(dadaFs, isBimeraDenovo)
+bimRs <- sapply(dadaRs, isBimeraDenovo)
+
+# Merge Paired Reads
+mergers <- mapply(mergePairs, dadaFs, derepFs, dadaRs, derepRs, SIMPLIFY=FALSE)
+mergers.nochim <- mapply(function(mm, bF, bR) mm[!bF[mm$forward] & !bR[mm$reverse],], mergers, bimFs, bimRs, SIMPLIFY=FALSE)
+seqtab <- makeSequenceTable(mergers.nochim[names(mergers.nochim) != "Mock"])
+```
+
+```{r construct_phyloseq_data_structure, include=FALSE, cache=cache_bool}
+# OTU Table
+seqs <- colnames(seqtab)
+otab <- otu_table(seqtab, taxa_are_rows=FALSE)
+colnames(otab) <- paste0("Seq", seq(ncol(otab)))
+
+# Sample Data
+sampledata <- read.csv("metadata.txt", header=TRUE, sep="")
+samdat <- sample_data(data.frame(sampledata,row.names = sampledata[,1]))
+
+# Taxonomic Table
+taxtab <- assignTaxonomy(seqs,"silva.bac.train.fa")
+tax_tab <- matrix(nrow=length(seqs),ncol=6)
+for(i in 1:nrow(tax_tab))
+  {tax_tab[i,] <- c(unlist(strsplit(taxtab[i],split=";")),rep("unknown",6-length(unlist(strsplit(taxtab[i],split=";")))))}
+colnames(tax_tab) <- c("Kingdom","Phylum","Class","Order","Family","Genus","Species")[1:ncol(tax_tab)]
+rownames(tax_tab) <- paste0("Seq", seq(ncol(otab)))
+
+# Phyloseq Object
+phyloseq <- phyloseq(otu_table(otab), sample_data(samdat), tax_table(tax_tab))
+colnames(tax_table(phyloseq)) <- c("Kingdom","Phylum","Class","Order","Family","Genus","Species")[1:length(colnames(tax_table(phyloseq)))]
+tax_table(phyloseq) <- gsub("[[:alpha:]]__","",tax_table(phyloseq))
+tax_table(phyloseq)[tax_table(phyloseq)==""] <- "unclassified"
+```
+```{r pre-report_calculations_pt2, include=FALSE, cache=cache_bool}
+random_tree <- rtree(ntaxa(phyloseq), rooted = TRUE, tip.label <- taxa_names(phyloseq))
+phyloseq_tree <- merge_phyloseq(phyloseq,random_tree)
+if(classify){
+  .qualitative <- DirichletMultinomial:::.qualitative
+  write.csv(t(otu_table(phyloseq)),"./OTUTable.csv")
+  otu <- as.matrix(read.csv("./OTUTable.csv", row.names=1))
+  otu <- otu[,order(colSums(otu), decreasing=TRUE)]
+  if(ncol(otu)>1000){otu <- otu[,1:1000]}
+  otu <- otu[rowSums(otu)>0,]
+  fit <- lapply(1:7, dmn, count = otu)
+  fit.min <- fit[[which.min(sapply(fit, laplace))]]
+  clust <- mixture(fit.min)
+  colnames(clust) <- c("A","B","C","D","E","F","G")[1:ncol(clust)]
+  clust <- data.frame(clust)
+  clust$Class <- colnames(clust)[apply(clust, 1, which.max)]
+  #sampledata=read.csv("sampledata2.txt", header=TRUE, sep="")
+  #### Custom editing ####
+  #sampledata <- sampledata[,c("sample","Patient_ID","Time_Point")]
+  #phylosamp <- matrix(unlist(strsplit(sample_names(phyloseq_tree),"_S")),nrow=110,byrow=TRUE)
+  #renamed <- lapply(phylosamp[,1],function(r){if(nchar(r)<4){return(paste("0",r,sep=""))} else{return(r)}})
+  #renamed <- sub("_","-",unlist(renamed))
+  #phylosamp <- cbind(phylosamp,renamed)
+  #phylosamp[,1] <- paste(phylosamp[,1],"_S",phylosamp[,2],sep="")
+  #samp_names <- phylosamp[order(phylosamp[,"renamed"]),1]
+  #samp=sample_data(data.frame(sampledata,row.names =sample_names(phyloseq_tree)))
+  #samp <- sample_data(data.frame(sampledata,row.names = samp_names))
+  #### End custom editing ####
+  #samp <- sample_data(data.frame(sampledata,row.names = sampledata[,1]))
+  #samp$Comm.Type <- clust[rownames(samp),"Class"]
+  sample_data(phyloseq_tree)$Class <- clust[rownames(sample_data(phyloseq_tree)),"Class"]
+  #phyloseq_final <- merge_phyloseq(phyloseq_tree,samp)
+}
+phyloseq_final <- phyloseq_tree
+```
+```{r pre-report_calculations_pt3, include=FALSE, cache=cache_bool}
+sample_data(phyloseq_final)[[meta_factor]] <- factor(sample_data(phyloseq_final)[[meta_factor]])
+diagadds <- phyloseq_to_deseq2(phyloseq_final,as.formula(paste("~ ", meta_factor)))
+geoMeans <- apply(counts(diagadds), 1, function(row) if (all(row == 0)) 0 else exp(mean(log(row[row != 0]))))
+diagadds <- estimateSizeFactors(diagadds, geoMeans=geoMeans)
+diagadds <- DESeq(diagadds, test="Wald", fitType="parametric")
+res <- results(diagadds, cooksCutoff = FALSE)
+res <- res[order(res$padj),]
+sigtab <- res[order(res$padj), ]
+sigtab <- cbind(as(sigtab, "data.frame"), as(tax_table(phyloseq_final)[rownames(sigtab), ], "matrix"))
+x <- tapply(sigtab$log2FoldChange, sigtab[[tax_level1]], function(x) max(x))
+x <- sort(x, TRUE)
+sigtab[[tax_level1]] <- factor(as.character(sigtab[[tax_level1]]), levels=names(x))
+x <- tapply(sigtab$log2FoldChange, sigtab[[tax_level2]], function(x) max(x))
+x <- sort(x, TRUE)
+sigtab[[tax_level2]] <- factor(as.character(sigtab[[tax_level2]]), levels=names(x))
+registerDoParallel(cores=7)
+GP.wufmds <- ordinate(phyloseq_final, "PCoA", distance="unifrac", weighted=TRUE, parallel=TRUE)
+```
+```{r pre-report_calculations_pt4, include=FALSE, cache=cache_bool}
+er_phy <- estimate_richness(phyloseq_final)
+rownames(er_phy) <- rownames(otu_table(phyloseq_final))
+df_phy <- data.frame(er_phy)
+df_phy$Patient.ID <- sample_data(phyloseq_final)$Patient_ID
+
+### Subset by 150 records ###
+#phyloseq_final_subset <- phyloseq_final
+#otu_table(phyloseq_final_subset) <- otu_table(phyloseq_final_subset)[1:150,]
+#mdf <- psmelt(phyloseq_final_subset)
+
+mdf<-psmelt(phyloseq_final)
+# Find top 18 entries for taxonomic level 1
+## 18 is the longest list in the legend before it extends off graph space
+agg_mdf_tax1 <- aggregate(as.formula(paste("Abundance ~",tax_level1)),mdf,sum)
+agg_mdf_tax1 <- agg_mdf_tax1[order(agg_mdf_tax1$Abundance,decreasing=TRUE),tax_level1]
+if(length(agg_mdf_tax1)>18){agg_mdf_tax1 <- agg_mdf_tax1[1:18]}
+# Find top 18 entries for taxonomic level 1
+agg_mdf_tax2 <- aggregate(as.formula(paste("Abundance ~",tax_level2)),mdf,sum)
+agg_mdf_tax2 <- agg_mdf_tax2[order(agg_mdf_tax2$Abundance,decreasing=TRUE),tax_level2]
+if(length(agg_mdf_tax2)>18){agg_mdf_tax2 <- agg_mdf_tax2[1:18]}
+```
+---
+title: "DADA2 Test Pipeline"
+author: "Michael Frisch @ Read Lab"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+There are `r ncol(otu_table(phyloseq))` samples, `r nrow(unique(otu_table(phyloseq)))` OTUs and `r nrow(unique(tax_table(phyloseq)))` unique classified taxa at `r c("Kingdom","Phylum","Class","Order","Family","Genus","Species")[ncol(tax_table(phyloseq))]` level.
+
+
+```{r graph1, echo=FALSE, cache=cache_bool}
+#plot_bar(phyloseq, fill=tax_level1, title=paste(tax_level1,"Abundance"))
+agg_mdf0 <- aggregate(as.formula(paste("Abundance ~",tax_level1,"+ Sample")),mdf,sum)
+agg_mdf0$Abundance <- log2(agg_mdf0$Abundance + 1)
+agg_mdf0 <- agg_mdf0[agg_mdf0[,tax_level1] %in% agg_mdf_tax1,]
+ggplot(agg_mdf0[order(agg_mdf0$Abundance,decreasing=TRUE),], aes_string(x = "Sample", y = "Abundance", fill = paste(tax_level1))) + geom_bar(stat = "identity", position = "stack", color = "black") + theme(axis.text.x = element_text(angle = -90, hjust = 0),plot.margin=unit(c(0.5,0.5,1,0), "cm")) + ggtitle(paste(tax_level1, "log2 Abundance Per Sample")) + guides(fill=guide_legend(ncol=1))
+```
+
+```{r graph2, echo=FALSE, cache=cache_bool}
+#plot_bar(phyloseq, fill=tax_level2, title=paste(tax_level2,"Abundance"))
+agg_mdf1 <- aggregate(as.formula(paste("Abundance ~",tax_level2,"+ Sample")),mdf,sum)
+agg_mdf1$Abundance <- log2(agg_mdf1$Abundance + 1)
+agg_mdf1 <- agg_mdf1[agg_mdf1[,tax_level2] %in% agg_mdf_tax2,]
+ggplot(agg_mdf1[order(agg_mdf1$Abundance,decreasing=TRUE),], aes_string(x = "Sample", y = "Abundance", fill = paste(tax_level2))) + geom_bar(stat = "identity", position = "stack", color = "black") + theme(axis.text.x = element_text(angle = -90, hjust = 0),plot.margin=unit(c(0.5,0.5,1,0), "cm")) + ggtitle(paste(tax_level2, "log2 Abundance Per Sample")) + guides(fill=guide_legend(ncol=1))
+```
+
+```{r graph3, echo=FALSE, cache=cache_bool}
+#plot_bar(phyloseq_final, x=meta_factor, fill=tax_level2, title=paste(tax_level2,"Abundance Per",chartr("_.","  ",meta_factor)))
+agg_mdf2 <- aggregate(as.formula(paste("Abundance ~",meta_factor,"+",tax_level2)),mdf,sum)
+agg_mdf2 <- agg_mdf2[agg_mdf2[,tax_level2] %in% agg_mdf_tax2,]
+ggplot(agg_mdf2[order(agg_mdf2$Abundance,decreasing=TRUE),], aes_string(x = paste(meta_factor), y = "Abundance", fill = "Genus")) + geom_bar(stat = "identity", position = "stack", color = "black") + theme(axis.text.x = element_text(angle = -90, hjust = 0)) + ggtitle(paste(tax_level2, "Abundance Per", chartr("_.", "  ", meta_factor))) + guides(fill=guide_legend(ncol=1))
+```
+
+```{r graph4, echo=FALSE}
+p=plot_bar(phyloseq_final,tax_level1,fill=tax_level2, facet_grid=as.formula(paste("~ ", meta_factor)),title=paste(tax_level1,"Abundance Per",chartr("_.","  ",meta_factor)))
+p + geom_bar(aes(color=tax_level2, fill=tax_level2), stat="identity", position="stack")+theme(axis.text.x=element_text(angle=-90,vjust=0.5,size=8,face="bold"))+theme(legend.position="right") + theme(legend.text = element_text(colour="blue", size=8, face="bold")) + guides(fill=guide_legend(ncol=1))
+```
+
+```{r graph5, echo=FALSE, cache=cache_bool}
+plotMA(diagadds,ylim=c(-2,2),main="DESeq2")
+```
+
+```{r graph6, echo=FALSE, cache=cache_bool}
+scale_fill_discrete <- function(palname = "Set1", ...) { scale_fill_brewer(palette = palname, ...) }
+ggplot(sigtab, aes_q(x=as.name(tax_level2), y=quote(sigtab$log2FoldChange), ylab="log2FoldChange", color=as.name(tax_level1))) + geom_point(size=2) + theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.3)) + ggtitle("Fold Change") + ylab("log2FoldChange")
+```
+
+```{r graph7, echo=FALSE, cache=cache_bool}
+agg_mdf3 <- aggregate(as.formula(paste("Abundance ~",tax_level2,"+ Sample")),mdf,sum)
+agg_check <- aggregate(as.formula(paste("Abundance ~",tax_level2)),agg_mdf3,sum)
+agg_check <- agg_check[order(agg_check$Abundance,decreasing=TRUE),]
+aggrows <- agg_check[1:20,1]
+agg_mdf3 <- agg_mdf3[agg_mdf3$Genus %in% aggrows,]
+Class <- sapply(agg_mdf3$Sample,function(x){return(sample_data(phyloseq_final)[x,meta_factor])})
+agg_mdf3 <- cbind(agg_mdf3,metafactor=unlist(Class))
+agg_mdf3 <- agg_mdf3[order(agg_mdf3$metafactor),]
+#p1=ggplot(mdf,aes_q(x=quote(mdf$Sample),y=quote(mdf$Abundance),fill=as.name(tax_level1)))
+p1=ggplot(agg_mdf3,aes_q(x=quote(agg_mdf3$Sample),y=quote(agg_mdf3$Abundance),fill=as.name(tax_level2)))
+p1+geom_bar(stat="identity",position="fill")+scale_fill_manual(values = c("grey26","red","chartreuse3","royalblue","darkorange","cyan2", "darkgreen","blue4", "yellow1", "violetred", "deepskyblue", "mediumorchid3","#89C5DA", "#DA5724", "#74D944", "#C84248","#673770", "#D3D93E", "#38333E", "#508578","#D7C1B1", "#689030", "#AD6F3B", "#CD9BCD","#D14285", "#6DDE88", "#652926", "#7FDCC0", "#8569D5", "#5E738F", "#D1A33D","#8A7C64", "#599861"))+theme(axis.text.x=element_text(angle=90,hjust=1,vjust=0.5))+ylab("Abundance")+xlab("Sample") + ggtitle("Relative Abundance") + facet_grid("~metafactor",scales = "free") + guides(fill=guide_legend(ncol=1))
+```
+
+```{r graph8, echo=FALSE, cache=cache_bool}
+p1+geom_bar(stat="identity")+scale_fill_manual(values = c("grey26","red","chartreuse3","royalblue","darkorange","cyan2", "darkgreen","blue4", "yellow1", "violetred", "deepskyblue", "mediumorchid3","#89C5DA", "#DA5724", "#74D944", "#C84248","#673770", "#D3D93E", "#38333E", "#508578","#D7C1B1", "#689030", "#AD6F3B", "#CD9BCD","#D14285", "#6DDE88", "#652926", "#7FDCC0", "#8569D5", "#5E738F", "#D1A33D","#8A7C64", "#599861"))+theme(axis.text.x=element_text(angle=90,hjust=1,vjust=0.5))+ylab("Abundance")+xlab("Sample")
+```
+
+```{r graph9, echo=FALSE, cache=cache_bool}
+p2 = plot_ordination(phyloseq_final, GP.wufmds, color=meta_factor, label = "sample", title=paste("PCoA of",chartr("_.","  ",meta_factor)))
+p2+ geom_point(size=2) + geom_line()
+```
+
+```{r graph10, echo=FALSE, cache=cache_bool}
+sample_data(phyloseq_final)$Patient_ID<-as.character(sample_data(phyloseq_final)$Patient_ID)
+p3 = plot_ordination(phyloseq_final, GP.wufmds, color="Patient_ID", label="sample", title="PCoA of Samples")
+p3+ geom_point(size=2) + geom_line()
+```
+
+```{r graph11a, echo=FALSE, cache=cache_bool}
+p4a = plot_richness(phyloseq_final, x = "sample", color = paste(meta_factor), measures = "Chao1", title=paste("Chao1 Diversity by",chartr("_.","  ",meta_factor)))
+#p4a + geom_point(size = 5, alpha = 0.7)
+p4a + geom_point(size = 5, alpha = 0.7) + scale_colour_discrete(name=chartr("_. ","\n\n\n",meta_factor)) + facet_grid(as.formula(paste("~",meta_factor)),scales = "free") + theme(panel.margin = unit(0.05, "lines"),plot.margin=unit(c(0.5,0,1.5,0.5), "cm"))
+```
+```{r graph11b, echo=FALSE, cache=cache_bool}
+p4b = plot_richness(phyloseq_final, x = "sample", color = paste(meta_factor), measures = "Shannon", title=paste("Shannon Diversity by",chartr("_.","  ",meta_factor)))
+#p4b + geom_point(size = 5, alpha = 0.7)
+p4b + geom_point(size = 5, alpha = 0.7) + scale_colour_discrete(name=chartr("_. ","\n\n\n",meta_factor)) + facet_grid(as.formula(paste("~",meta_factor)),scales = "free") + theme(panel.margin = unit(0.05, "lines"),plot.margin=unit(c(0.5,0,1.5,0.5), "cm"))
+```
+```{r graph12, echo=FALSE, cache=cache_bool}
+#p5 = plot_richness(phyloseq_final, x = "sample", color = "Patient_ID", measures = c("Chao1", "Shannon"), title="Alpha Diversity Richness by Sample")
+#p5 + geom_point(size = 5, alpha = 0.7)
+par(mfrow = c(1, 2), oma = c(2,2,2,0)+0.1, mar = c(4,2,1,1))
+cols <- colorRampPalette(brewer.pal(8,"Accent"))(20)
+boxplot(Chao1 ~ Patient.ID,data=df_phy,main="Chao1",xlab="Patient Number",ylab="Alpha Diversity Measure Score",col=cols,las=2)
+boxplot(Shannon ~ Patient.ID,data=df_phy,main="Shannon",xlab="Patient Number",col=cols,las=2)
+mtext("Alpha Diversity by Grouped Sample", outer = TRUE , cex = 2)
+```
+
+```{r graph13, echo=FALSE}
+if(classify){
+  heatmapdmn(otu, fit[[1]], fit.min, ntaxa=30)
+}
+```
